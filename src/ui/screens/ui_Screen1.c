@@ -465,10 +465,13 @@ void ui_calendar_add_event(int col, bool all_day, int hh, int mm, const char * t
 
     if (all_day)
     {
+        // Bigger weight font (Bold 18) makes the inverted banner read as
+        // unambiguously bold — Bold 14 dithered to B/W doesn't visually
+        // separate from regular at this size.
         lv_obj_t * banner = lv_label_create(box);
         lv_obj_set_width(banner, AGENDA_COL_W);
         lv_label_set_text(banner, title ? title : "");
-        lv_obj_set_style_text_font(banner, &lv_font_montserrat_bold_14, LV_PART_MAIN);
+        lv_obj_set_style_text_font(banner, &lv_font_montserrat_bold_18, LV_PART_MAIN);
         lv_obj_set_style_text_color(banner, lv_color_white(), LV_PART_MAIN);
         lv_obj_set_style_text_align(banner, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
         lv_obj_set_style_bg_color(banner, lv_color_black(), LV_PART_MAIN);
@@ -478,7 +481,7 @@ void ui_calendar_add_event(int col, bool all_day, int hh, int mm, const char * t
         lv_obj_set_style_pad_left(banner, 4, LV_PART_MAIN);
         lv_obj_set_style_pad_right(banner, 4, LV_PART_MAIN);
         lv_obj_set_style_radius(banner, 0, LV_PART_MAIN);
-        lv_label_set_long_mode(banner, LV_LABEL_LONG_WRAP);
+        lv_label_set_long_mode(banner, LV_LABEL_LONG_DOT);
     }
     else
     {
@@ -503,12 +506,15 @@ void ui_calendar_add_event(int col, bool all_day, int hh, int mm, const char * t
         lv_obj_set_style_pad_all(time_lbl, 0, LV_PART_MAIN);
 
         lv_obj_t * title_lbl = lv_label_create(row);
+        // Explicit width (rather than flex_grow) so LV_LABEL_LONG_DOT has a
+        // concrete width to truncate against; flex_grow defers width to
+        // layout time which can leave DOT mode no-op'd.
+        lv_obj_set_width(title_lbl, AGENDA_COL_W - AGENDA_TIME_W - 6);
         lv_label_set_text(title_lbl, title ? title : "");
         lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_14, LV_PART_MAIN);
         lv_obj_set_style_text_color(title_lbl, lv_color_black(), LV_PART_MAIN);
         lv_obj_set_style_pad_all(title_lbl, 0, LV_PART_MAIN);
-        lv_label_set_long_mode(title_lbl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_flex_grow(title_lbl, 1);
+        lv_label_set_long_mode(title_lbl, LV_LABEL_LONG_DOT);
     }
 
     // Horizontal divider beneath the event.

@@ -11,6 +11,8 @@
 #include "lvgl.h"
 #include "ui/ui.h"
 #include "secrets.h"
+#include "config.h"
+#include "setup_mode.h"
 
 #define ENABLE_GxEPD2_GFX 0
 #include <GxEPD2_BW.h>
@@ -48,7 +50,9 @@ WiFiMulti wifiMulti;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP);
 
-static volatile bool g_full_flush_done = false;
+// Not static — setup_mode.cpp's epd_render_and_refresh() reads it via
+// the helper exposed below.
+volatile bool g_full_flush_done = false;
 
 // ---- Latest BG snapshot (filled by fetch_bg) --------------------------
 #define BG_POINTS_MAX 40
@@ -74,11 +78,13 @@ static struct bg_snapshot bg = {{0}, {0}, 0, 0.0f, 0.0f, false, 0, "", false};
 //    becomes a per-day subtitle, not an event row.
 //  - The personal/work calendars produce the event rows.
 #define TZ_POSIX           "GMT0BST,M3.5.0/1,M10.5.0/2"
-#define EVENTS_PER_DAY_MAX 8
-// Bumped to 48 so titles like "Distributor Open Projects - Strategic" wrap
-// onto a 2nd line instead of mid-word truncating; per the column-height
-// math, ~6 events at 1.5-line average still fits in the 220px events box.
-#define EVENT_TITLE_MAX    48
+// 7 events caps the column at 213px even when one all-day banner is
+// present (banner=31 + 7*22 + 7*4 + 4 = 217), leaving margin in the
+// 220px events box. Title buffer at 30 keeps the storage tight while
+// still longer than the ~18-char single-line display width — the
+// label's LV_LABEL_LONG_DOT mode trims the visible text down further.
+#define EVENTS_PER_DAY_MAX 7
+#define EVENT_TITLE_MAX    30
 
 enum cal_source : uint8_t { CAL_ISLA, CAL_PERSONAL, CAL_WORK };
 
@@ -141,7 +147,7 @@ static void epd_setup(void)
 // ---- WiFi -------------------------------------------------------------
 static bool connect_wifi(void)
 {
-  wifiMulti.addAP(SSID_NAME, SSID_PASSWORD);
+  wifiMulti.addAP(cfg.wifi_ssid.c_str(), cfg.wifi_password.c_str());
   uint32_t start = millis();
   while (wifiMulti.run() != WL_CONNECTED)
   {
@@ -223,7 +229,7 @@ static bool fetch_bg(void)
   secure.setInsecure();
 
   HTTPClient http;
-  if (!http.begin(secure, BG_API_URL))
+  if (!http.begin(secure, cfg.bg_api_url.c_str()))
   {
     Serial.println("[bg] http.begin failed");
     return false;
@@ -684,9 +690,9 @@ static bool fetch_calendar(const char *url, cal_source src, const char *tag)
 
 static void fetch_calendars(void)
 {
-  fetch_calendar(ICAL_ISLA_URL,     CAL_ISLA,     "isla");
-  fetch_calendar(ICAL_PERSONAL_URL, CAL_PERSONAL, "personal");
-  fetch_calendar(ICAL_WORK_URL,     CAL_WORK,     "work");
+  fetch_calendar(cfg.ical_isla_url.c_str(),     CAL_ISLA,     "isla");
+  fetch_calendar(cfg.ical_personal_url.c_str(), CAL_PERSONAL, "personal");
+  fetch_calendar(cfg.ical_work_url.c_str(),     CAL_WORK,     "work");
   sort_day_events();
 
   // If today has no remaining timed events, slide the agenda forward one
@@ -844,30 +850,36 @@ static void render_screen(void)
   }
 }
 
-// Stuff `bg` with synthetic worst-case values so the layout's right-extent
-// is visible without waiting for a real high reading.
-static void populate_preview(void)
-{
-  bg.point_count = 0;
-  bg.latest_mmol = 16.6f;
-  bg.delta_mmol = -2.4f;
-  bg.have_delta = true;
-  time_t now_s = time(NULL);
-  bg.latest_mills = (now_s > 0 ? (long long)now_s : 0LL) * 1000LL - 120000LL; // 2 min ago
-  strncpy(bg.direction, "FortyFiveDown", sizeof(bg.direction) - 1);
-  bg.direction[sizeof(bg.direction) - 1] = '\0';
-  bg.ok = true;
-}
-
 // True if BUTTON_PIN is held LOW right now (active-low) or if the previous
-// deep-sleep wake was triggered by an ext0 GPIO transition on it.
-static bool button_preview_requested(void)
+// deep-sleep wake was triggered by an ext0 GPIO transition on it. Used to
+// drop into setup_mode_run() instead of the normal fetch+render path.
+static bool button_setup_requested(void)
 {
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
     return true;
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   delay(10); // settle the pull-up
   return digitalRead(BUTTON_PIN) == LOW;
+}
+
+// Spin LVGL until the bottom-right tile has been buffered, then trigger
+// one full e-paper refresh. Used by both the dashboard render and by
+// setup_mode for its setup-screen render.
+void epd_render_and_refresh(void)
+{
+  g_full_flush_done = false;
+  while (!g_full_flush_done)
+  {
+    lv_timer_handler();
+    delay(10);
+  }
+  display.refresh(false);
+}
+
+// Cuts the e-paper power rail. Used before deep sleep.
+void epd_power_off(void)
+{
+  digitalWrite(7, LOW);
 }
 
 // Sleep until ~POST_DATA_DELAY seconds after the next expected CGM reading;
@@ -898,51 +910,45 @@ void setup(void)
   setenv("TZ", TZ_POSIX, 1);
   tzset();
 
-  bool preview = button_preview_requested();
-  Serial.printf("[boot] preview=%d\n", preview ? 1 : 0);
+  config_load();
 
+  bool want_setup = button_setup_requested();
+  Serial.printf("[boot] setup_mode=%d\n", want_setup ? 1 : 0);
+
+  // Power up display + LVGL early so setup mode can render its screen too.
+  pinMode(7, OUTPUT);
+  digitalWrite(7, HIGH);
+  epd_setup();
+  lv_init();
+  lv_tick_set_cb(my_tick);
+  lvDisplay = lv_display_create(SCR_WIDTH, SCR_HEIGHT);
+  lv_display_set_flush_cb(lvDisplay, my_disp_flush);
+  lv_display_set_buffers(lvDisplay, lvBuffer[0], lvBuffer[1], LVBUF, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+  if (want_setup)
+  {
+    setup_mode_run();   // never returns
+  }
+
+  // Normal mode: connect, fetch, render dashboard, sleep.
   bool wifi_ok = connect_wifi();
   if (wifi_ok)
     sync_ntp_clock();
 
   prep_days();
 
-  if (preview)
-  {
-    populate_preview();
-  }
-  else if (wifi_ok)
+  if (wifi_ok)
   {
     fetch_bg();
     fetch_calendars();
   }
 
-  pinMode(7, OUTPUT);
-  digitalWrite(7, HIGH);
-
-  epd_setup();
-  lv_init();
-  lv_tick_set_cb(my_tick);
-
-  lvDisplay = lv_display_create(SCR_WIDTH, SCR_HEIGHT);
-  lv_display_set_flush_cb(lvDisplay, my_disp_flush);
-  lv_display_set_buffers(lvDisplay, lvBuffer[0], lvBuffer[1], LVBUF, LV_DISPLAY_RENDER_MODE_PARTIAL);
-
   ui_init();
   render_screen();
-
-  while (!g_full_flush_done)
-  {
-    lv_timer_handler();
-    delay(10);
-  }
-
-  // Single full refresh after all tiles have been buffered. Slow (~2s) but
-  // wipes any prior-frame ghosting so the agenda's dense text stays clean.
-  display.refresh(false);
+  epd_render_and_refresh();
 
   lv_deinit();
-  digitalWrite(7, LOW);
+  epd_power_off();
 
   uint32_t sleep_s = compute_sleep_seconds();
   Serial.printf("[sleep] %u s\n", (unsigned)sleep_s);

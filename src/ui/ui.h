@@ -73,6 +73,7 @@ LV_FONT_DECLARE(ui_font_opensansItalic2);
 LV_FONT_DECLARE(ui_font_opensansSemiBolt20);
 LV_FONT_DECLARE(ui_font_opensansSemiBolt21);
 LV_FONT_DECLARE(lv_font_montserrat_bold_72);
+LV_FONT_DECLARE(lv_font_montserrat_bold_18);
 LV_FONT_DECLARE(lv_font_montserrat_bold_14);
 
 void ui_init(void);
